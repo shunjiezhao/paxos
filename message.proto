@@ -1,0 +1,40 @@
+syntax = 'proto3';
+
+package paxos;
+option go_package='./paxos'; 
+
+message PaxosInstanceId {
+    string key = 1;
+    int64 ver = 2;
+}
+
+message BallotNum {
+    int64 N =1;
+    int64 proposer_id = 2;
+}
+
+
+message Value {
+  string val = 1;
+}
+
+message Proposal{
+  PaxosInstanceId  id = 1;
+  Value v = 2;
+  BallotNum bal = 3; // current proposal
+}
+
+
+message Acceptor{
+  BallotNum last_proposal = 1;
+
+  Value val = 2;
+  BallotNum last_accept = 3;
+}
+
+
+
+service Paxos{
+  rpc Phase1 (Proposal) returns (Proposal); // prepare
+  rpc Phase2 (Proposal) returns (Proposal); // accept
+}

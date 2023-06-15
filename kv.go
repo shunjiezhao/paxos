@@ -20,7 +20,8 @@ func (a *BallotNum) GE(b *BallotNum) bool {
 	return a.ProposerId >= b.ProposerId
 }
 
-func (p *Proposal) Prepare(acceptorIds []int, quorum int) (*Value, *BallotNum, error) {
+func (p *Proposal) Prepare(acceptorIds []int) (*Value, *BallotNum, error) {
+	quorum := len(acceptorIds)/2 + 1
 	all := p.rpcToAll(acceptorIds, "prepare", p)
 	successCnt := 0
 	highBal := *p.Bal
@@ -37,7 +38,7 @@ func (p *Proposal) Prepare(acceptorIds []int, quorum int) (*Value, *BallotNum, e
 			continue
 		}
 
-		if r.LastAccept.GE(maxVoted.LastAccept) { // if get a biggest accepted proposal, then we will catch up it
+		if r.LastAccept != nil && r.LastAccept.GE(maxVoted.LastAccept) { // if get a biggest accepted proposal, then we will catch up it
 			maxVoted = r
 		}
 		successCnt++
@@ -48,7 +49,8 @@ func (p *Proposal) Prepare(acceptorIds []int, quorum int) (*Value, *BallotNum, e
 	return nil, &highBal, errors.New("not enough quorum")
 }
 
-func (p *Proposal) Accept(acceptorIds []int, quorum int) (*BallotNum, error) {
+func (p *Proposal) Accept(acceptorIds []int) (*BallotNum, error) {
+	quorum := len(acceptorIds)/2 + 1
 	all := p.rpcToAll(acceptorIds, "accept", p)
 	successCnt := 0
 	highBal := *p.Bal
@@ -92,7 +94,7 @@ func (p *Proposal) rpcToAll(ids []int, opName string, args *Proposal) []*Accepto
 		if opName == "prepare" {
 			acceptor, err = client.Prepare(context.Background(), args)
 		} else {
-			acceptor, err = client.Prepare(context.Background(), args)
+			acceptor, err = client.Accept(context.Background(), args)
 		}
 		if err != nil {
 			log.Printf("Proposer: %+v fail from A(%d) : %v", opName, id, err)
@@ -105,7 +107,7 @@ func (p *Proposal) rpcToAll(ids []int, opName string, args *Proposal) []*Accepto
 
 type KeyAcceptor struct {
 	mu       sync.Mutex
-	acceptor Acceptor
+	acceptor *Acceptor
 }
 
 type KVServer struct {
@@ -115,21 +117,24 @@ type KVServer struct {
 }
 
 func (s *KVServer) Prepare(ctx context.Context, proposal *Proposal) (*Acceptor, error) {
-	log.Printf("[KvServer]: prepare: %+v", proposal)
 	v := s.getKeyAcceptorL(proposal.Id)
 	defer v.mu.Unlock()
+	log.Printf("[KvServer]:v: %+v prepare: %+v ", v.acceptor, proposal)
 
 	reply := v.acceptor // get this version accepted proposal in this acceptor
 	if proposal.Bal.GE(reply.LastProposal) {
+		log.Println("update")
 		v.acceptor.LastProposal = proposal.Bal // biggest proposal
 		// and we should not allow small proposal be accepted
 	}
-	return &reply, nil // will return lastProposal if have
+	log.Printf("[KvServer]:v: %+v", v.acceptor)
+	return reply, nil // will return lastProposal if have
 }
 
 func (s *KVServer) Accept(ctx context.Context, proposal *Proposal) (*Acceptor, error) {
 	v := s.getKeyAcceptorL(proposal.Id)
 	defer v.mu.Unlock()
+	log.Printf("[KvServer]:v: %+v Accept: %+v ", v.acceptor, proposal)
 
 	reply := &Acceptor{
 		LastProposal: proto.Clone(v.acceptor.LastProposal).(*BallotNum), // return last proposal
@@ -152,7 +157,7 @@ func (s *KVServer) getKeyAcceptorL(id *PaxosInstanceId) *KeyAcceptor {
 	record, ok := s.Storage[key]
 	if !ok { // not have this key
 		s.Storage[key] = &KeyAcceptor{
-			acceptor: Acceptor{
+			acceptor: &Acceptor{
 				LastAccept:   &BallotNum{},
 				LastProposal: &BallotNum{},
 			},
@@ -163,21 +168,24 @@ func (s *KVServer) getKeyAcceptorL(id *PaxosInstanceId) *KeyAcceptor {
 	return record
 }
 
-func runAcceptors(ids []int) (kvs []*grpc.Server) {
-	for _, id := range ids {
+func runAcceptors(ids []int, kvServer []*KVServer) (kvs []*grpc.Server, clean func()) {
+	for i, id := range ids {
 		listen, err := net.Listen("tcp", getAcceptorAddress(id))
 		if err != nil {
 			panic(err)
 		}
 		log.Println("run server in address", getAcceptorAddress(id))
 		server := grpc.NewServer()
-		RegisterPaxosKvServer(server, &KVServer{
-			Storage: map[string]*KeyAcceptor{},
-		})
+		RegisterPaxosKvServer(server, kvServer[i])
 		reflection.Register(server)
 
 		go server.Serve(listen)
 		kvs = append(kvs, server)
+	}
+	clean = func() {
+		for _, kv := range kvs {
+			kv.Stop()
+		}
 	}
 	return
 }

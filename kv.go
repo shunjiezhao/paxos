@@ -81,27 +81,33 @@ func getAcceptorAddress(id int) string {
 func (p *Proposal) rpcToAll(ids []int, opName string, args *Proposal) []*Acceptor {
 	log.Println("rpcToAll method: ", opName)
 	ans := make([]*Acceptor, len(ids))
+	wg := &sync.WaitGroup{}
+	wg.Add(len(ids))
 	for i, id := range ids {
-		address := getAcceptorAddress(id)
-		conn, err := grpc.Dial(address,
-			grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Fatal("dial fail", err)
-		}
-		defer conn.Close()
-		client := NewPaxosKvClient(conn)
-		var acceptor *Acceptor
-		if opName == "prepare" {
-			acceptor, err = client.Prepare(context.Background(), args)
-		} else {
-			acceptor, err = client.Accept(context.Background(), args)
-		}
-		if err != nil {
-			log.Printf("Proposer: %+v fail from A(%d) : %v", opName, id, err)
-		}
-		log.Printf("Proposer: recv %s reply from A(%d): %v", opName, id, acceptor)
-		ans[i] = acceptor
+		go func(i, id int) {
+			defer wg.Done()
+			address := getAcceptorAddress(id)
+			conn, err := grpc.Dial(address,
+				grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Fatal("dial fail", err)
+			}
+			defer conn.Close()
+			client := NewPaxosKvClient(conn)
+			var acceptor *Acceptor
+			if opName == "prepare" {
+				acceptor, err = client.Prepare(context.Background(), args)
+			} else {
+				acceptor, err = client.Accept(context.Background(), args)
+			}
+			if err != nil {
+				log.Printf("Proposer: %+v fail from A(%d) : %v", opName, id, err)
+			}
+			log.Printf("Proposer: recv %s reply from A(%d): %v", opName, id, acceptor)
+			ans[i] = acceptor
+		}(i, id)
 	}
+	wg.Wait()
 	return ans
 }
 
@@ -123,11 +129,9 @@ func (s *KVServer) Prepare(ctx context.Context, proposal *Proposal) (*Acceptor, 
 
 	reply := v.acceptor // get this version accepted proposal in this acceptor
 	if proposal.Bal.GE(reply.LastProposal) {
-		log.Println("update")
 		v.acceptor.LastProposal = proposal.Bal // biggest proposal
 		// and we should not allow small proposal be accepted
 	}
-	log.Printf("[KvServer]:v: %+v", v.acceptor)
 	return reply, nil // will return lastProposal if have
 }
 

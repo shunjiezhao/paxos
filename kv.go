@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/protobuf/proto"
 	"log"
+	"net"
 	"sync"
-	"time"
 )
 
 func (a *BallotNum) GE(b *BallotNum) bool {
@@ -19,14 +20,8 @@ func (a *BallotNum) GE(b *BallotNum) bool {
 	return a.ProposerId >= b.ProposerId
 }
 
-func (p *Proposal) Phase1(acceptorIds []int, quorum int) (*Value, *BallotNum, error) {
-
-	ctx, cancelFunc := context.WithTimeout(context.Background(), time.Second)
-
-	defer cancelFunc()
-	all := p.rpcToAll(ctx, acceptorIds, "prepare", func(client PaxosClient) (*Acceptor, error) {
-		return client.Prepare(ctx, p)
-	})
+func (p *Proposal) Prepare(acceptorIds []int, quorum int) (*Value, *BallotNum, error) {
+	all := p.rpcToAll(acceptorIds, "prepare", p)
 	successCnt := 0
 	highBal := *p.Bal
 	maxVoted := &Acceptor{LastAccept: &BallotNum{}}
@@ -53,13 +48,8 @@ func (p *Proposal) Phase1(acceptorIds []int, quorum int) (*Value, *BallotNum, er
 	return nil, &highBal, errors.New("not enough quorum")
 }
 
-func (p *Proposal) Phase2(acceptorIds []int, quorum int) (*BallotNum, error) {
-	ctx, cancelFunc := context.WithTimeout(context.Background(), time.Second)
-
-	defer cancelFunc()
-	all := p.rpcToAll(ctx, acceptorIds, "accept", func(client PaxosClient) (*Acceptor, error) {
-		return client.Accept(ctx, p)
-	})
+func (p *Proposal) Accept(acceptorIds []int, quorum int) (*BallotNum, error) {
+	all := p.rpcToAll(acceptorIds, "accept", p)
 	successCnt := 0
 	highBal := *p.Bal
 
@@ -82,29 +72,34 @@ func (p *Proposal) Phase2(acceptorIds []int, quorum int) (*BallotNum, error) {
 	return &highBal, errors.New("not enough quorum")
 }
 
-func (p *Proposal) rpcToAll(ctx context.Context, ids []int, opName string, op func(client PaxosClient) (*Acceptor, error)) []*Acceptor {
-	ans := make([]*Acceptor, len(ids))
-	wg := &sync.WaitGroup{}
-	for i, id := range ids {
-		go func(i, id int) {
-			defer wg.Done()
-			address := fmt.Sprintf("127.0.0.1:%d", 50000+int64(id))
-			conn, err := grpc.DialContext(ctx, address,
-				grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				log.Fatal("dial fail", err)
-			}
-			defer conn.Close()
-			acceptor, err := op(NewPaxosClient(conn))
-			if err != nil {
-				log.Printf("Proposer: %+v fail from A(%d) : %v", opName, id, err)
-			}
-			log.Printf("Proposer: recv %s reply from A(%d): %v", opName, id, acceptor)
-			ans[i] = acceptor
+func getAcceptorAddress(id int) string {
+	return fmt.Sprintf("127.0.0.1:%d", 5000+id)
+}
 
-		}(i, id)
+func (p *Proposal) rpcToAll(ids []int, opName string, args *Proposal) []*Acceptor {
+	log.Println("rpcToAll method: ", opName)
+	ans := make([]*Acceptor, len(ids))
+	for i, id := range ids {
+		address := getAcceptorAddress(id)
+		conn, err := grpc.Dial(address,
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Fatal("dial fail", err)
+		}
+		defer conn.Close()
+		client := NewPaxosKvClient(conn)
+		var acceptor *Acceptor
+		if opName == "prepare" {
+			acceptor, err = client.Prepare(context.Background(), args)
+		} else {
+			acceptor, err = client.Prepare(context.Background(), args)
+		}
+		if err != nil {
+			log.Printf("Proposer: %+v fail from A(%d) : %v", opName, id, err)
+		}
+		log.Printf("Proposer: recv %s reply from A(%d): %v", opName, id, acceptor)
+		ans[i] = acceptor
 	}
-	wg.Wait()
 	return ans
 }
 
@@ -114,14 +109,15 @@ type KeyAcceptor struct {
 }
 
 type KVServer struct {
-	UnimplementedPaxosServer
+	UnimplementedPaxosKvServer
 	mu      sync.Mutex
 	Storage map[string]*KeyAcceptor
 }
 
 func (s *KVServer) Prepare(ctx context.Context, proposal *Proposal) (*Acceptor, error) {
-	v := s.getLockVersion(proposal.Id)
-	defer v.mu.Lock()
+	log.Printf("[KvServer]: prepare: %+v", proposal)
+	v := s.getKeyAcceptorL(proposal.Id)
+	defer v.mu.Unlock()
 
 	reply := v.acceptor // get this version accepted proposal in this acceptor
 	if proposal.Bal.GE(reply.LastProposal) {
@@ -132,8 +128,8 @@ func (s *KVServer) Prepare(ctx context.Context, proposal *Proposal) (*Acceptor, 
 }
 
 func (s *KVServer) Accept(ctx context.Context, proposal *Proposal) (*Acceptor, error) {
-	v := s.getLockVersion(proposal.Id)
-	defer v.mu.Lock()
+	v := s.getKeyAcceptorL(proposal.Id)
+	defer v.mu.Unlock()
 
 	reply := &Acceptor{
 		LastProposal: proto.Clone(v.acceptor.LastProposal).(*BallotNum), // return last proposal
@@ -148,7 +144,7 @@ func (s *KVServer) Accept(ctx context.Context, proposal *Proposal) (*Acceptor, e
 	return reply, nil
 }
 
-func (s *KVServer) getLockVersion(id *PaxosInstanceId) *KeyAcceptor {
+func (s *KVServer) getKeyAcceptorL(id *PaxosInstanceId) *KeyAcceptor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -165,4 +161,23 @@ func (s *KVServer) getLockVersion(id *PaxosInstanceId) *KeyAcceptor {
 	}
 	record.mu.Lock()
 	return record
+}
+
+func runAcceptors(ids []int) (kvs []*grpc.Server) {
+	for _, id := range ids {
+		listen, err := net.Listen("tcp", getAcceptorAddress(id))
+		if err != nil {
+			panic(err)
+		}
+		log.Println("run server in address", getAcceptorAddress(id))
+		server := grpc.NewServer()
+		RegisterPaxosKvServer(server, &KVServer{
+			Storage: map[string]*KeyAcceptor{},
+		})
+		reflection.Register(server)
+
+		go server.Serve(listen)
+		kvs = append(kvs, server)
+	}
+	return
 }
